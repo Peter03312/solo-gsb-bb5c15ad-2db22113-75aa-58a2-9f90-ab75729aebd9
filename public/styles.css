@@ -256,3 +256,6 @@ td.cell-expo { font-family: var(--mono); font-size: 12.5px; white-space: nowrap;
   main { padding: 14px; }
   .form-row label { width: 130px; }
 }
+
+/* 滚动 24 小时曝光上限：未设置（不限制）时的弱化展示 */
+.daily-off { color: var(--muted); font-weight: 400; font-size: 12px; }

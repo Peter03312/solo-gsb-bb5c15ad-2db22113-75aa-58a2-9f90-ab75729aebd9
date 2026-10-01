@@ -17,11 +17,13 @@ CREATE TABLE IF NOT EXISTS meta (
 );
 
 -- 作品：展期曝光上限（lux·min）与既有累计量
+-- daily_limit_amount：可选的滚动 24 小时曝光上限（lux·min）；NULL 表示不限制，非空须非负
 CREATE TABLE IF NOT EXISTS artworks (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   name TEXT NOT NULL UNIQUE,
   limit_amount REAL NOT NULL CHECK (limit_amount >= 0),
   existing_amount REAL NOT NULL CHECK (existing_amount >= 0),
+  daily_limit_amount REAL CHECK (daily_limit_amount IS NULL OR daily_limit_amount >= 0),
   note TEXT NOT NULL DEFAULT ''
 );
 
@@ -126,9 +128,18 @@ CREATE TABLE IF NOT EXISTS quota_group_members (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_quota_group_members_artwork ON quota_group_members(artwork_id);
 `;
 
-// 旧库升级：为已存在的 slots 表补齐多段结算列
+// 旧库升级：为已存在的 slots 表补齐多段结算列；为 artworks 补齐滚动 24 小时曝光上限列
 const MIGRATIONS = [
-  `ALTER TABLE slots ADD COLUMN actual_segments TEXT NOT NULL DEFAULT '[]'`,
+  {
+    table: 'slots',
+    column: 'actual_segments',
+    sql: `ALTER TABLE slots ADD COLUMN actual_segments TEXT NOT NULL DEFAULT '[]'`,
+  },
+  {
+    table: 'artworks',
+    column: 'daily_limit_amount',
+    sql: `ALTER TABLE artworks ADD COLUMN daily_limit_amount REAL`,
+  },
 ];
 
 function openDb() {
@@ -139,10 +150,10 @@ function openDb() {
   db.pragma('journal_mode = WAL');
   db.pragma('foreign_keys = ON');
   db.exec(SCHEMA);
-  for (const sql of MIGRATIONS) {
-    const hasCol = db.prepare("PRAGMA table_info(slots)").all()
-      .some((c) => c.name === 'actual_segments');
-    if (!hasCol) db.exec(sql);
+  for (const m of MIGRATIONS) {
+    const hasCol = db.prepare(`PRAGMA table_info(${m.table})`).all()
+      .some((c) => c.name === m.column);
+    if (!hasCol) db.exec(m.sql);
   }
   return db;
 }

@@ -215,6 +215,159 @@ function representativeLux(segments) {
   return segments.length === 1 ? segments[0].lux : null;
 }
 
+// ---------- 滚动 24 小时曝光上限 ----------
+// 对任意连续 24 小时窗口（分钟精度，半开区间 [t, t+1440)）累计作品曝光：
+//   已结束时段取实际分段、进行中取冻结计划、未开始取计划、有效计划外记录取归档分段；
+//   跨窗口边界的分段按重合分钟拆分；同一作品的各时段 / 记录逐条相加。
+const ROLLING_WINDOW_MINUTES = 24 * 60;
+
+const windowMinToStr = (m) => toDTStr(new Date(m * 60000));
+
+// 已结束时段 -> 实际照度分段（分钟区间）
+function finishedSlotPieces(slot) {
+  return loadSegments(slot)
+    .map((g) => {
+      const s = parseDateTime(g.start);
+      const e = parseDateTime(g.end);
+      if (s.error || e.error) return null;
+      return { start: s.minutes, end: e.minutes, lux: g.lux };
+    })
+    .filter((g) => g && g.end > g.start && isNonNegNumber(g.lux));
+}
+
+// 未开始 / 进行中时段 -> 冻结（计划）照度分段（分钟区间，整段一个照度）
+function plannedSlotPieces(slot) {
+  if (slot.status === 'finished') return finishedSlotPieces(slot);
+  const s = parseDateTime(slot.planned_start);
+  const e = parseDateTime(slot.planned_end);
+  if (s.error || e.error || e.minutes <= s.minutes || !isNonNegNumber(slot.planned_lux)) return [];
+  return [{ start: s.minutes, end: e.minutes, lux: slot.planned_lux }];
+}
+
+// 有效计划外曝光记录 -> 归档照度分段（分钟区间）
+function exposureRecordPieces(rec) {
+  return parseJsonArr(rec.segments)
+    .map((g) => {
+      const s = parseDateTime(g.start);
+      const e = parseDateTime(g.end);
+      if (s.error || e.error) return null;
+      return { start: s.minutes, end: e.minutes, lux: g.lux };
+    })
+    .filter((g) => g && g.end > g.start && isNonNegNumber(g.lux));
+}
+
+// 窗口 [wStart, wEnd) 内的累计曝光：跨边界分段按重合分钟拆分后求和
+function windowExposureAt(pieces, wStart, wEnd) {
+  let total = 0;
+  for (const p of pieces) {
+    const lo = Math.max(p.start, wStart);
+    const hi = Math.min(p.end, wEnd);
+    if (hi > lo) total += (hi - lo) * p.lux;
+  }
+  return total;
+}
+
+// 窗口与这些分段是否有至少 1 分钟重合（用于限定“本批 / 本时段参与的窗口”）
+function windowTouches(pieces, wStart, wEnd) {
+  return pieces.some((p) => Math.min(p.end, wEnd) - Math.max(p.start, wStart) > 0);
+}
+
+// 分钟 x（半开区间 [x, x+1)）处作品承受的照度之和（同一作品多条分段时逐条相加）
+function luxAtMinute(pieces, x) {
+  let s = 0;
+  for (const p of pieces) if (p.start <= x && x < p.end) s += p.lux;
+  return s;
+}
+
+// 扫描作品的滚动窗口曝光。
+// pieces：参与累计的全部分段；focus：只考察与这些分段（本批 / 本时段）重合的窗口，
+// null 表示全部窗口。返回：
+//   earliest —— 最早超限窗口（整批拒绝时指出“最早超限窗口及超额量”）
+//   worst    —— 超额量最大的窗口（启动阻断时给出滚动缺口）
+function scanRollingWindows(pieces, limit, focus = null) {
+  if (!pieces.length || !isNonNegNumber(limit)) return { earliest: null, worst: null };
+  // 仅整数分钟起点、且与 focus 至少重合 1 分钟的窗口：t ∈ [start-W+1, end-1]
+  const lo = focus ? Math.min(...focus.map((p) => p.start - ROLLING_WINDOW_MINUTES + 1))
+    : Math.min(...pieces.map((p) => p.start - ROLLING_WINDOW_MINUTES + 1));
+  const hi = focus ? Math.max(...focus.map((p) => p.end - 1))
+    : Math.max(...pieces.map((p) => p.end - 1));
+  if (hi < lo) return { earliest: null, worst: null };
+
+  // F(t)=窗口[t,t+W)累计在 t 越过任一分段边界（左边界 p.start/p.end，
+  // 或右边界 p.start-W/p.end-W）时改变斜率；事件之间 F(t) 为线性。
+  const events = new Set([lo, hi + 1]);
+  for (const p of pieces) {
+    events.add(p.start).add(p.end);
+    events.add(p.start - ROLLING_WINDOW_MINUTES).add(p.end - ROLLING_WINDOW_MINUTES);
+  }
+  const E = [...events].filter((t) => t >= lo && t <= hi + 1).sort((a, b) => a - b);
+
+  let earliest = null;
+  let worst = null;
+  const consider = (t) => {
+    const total = round3(windowExposureAt(pieces, t, t + ROLLING_WINDOW_MINUTES));
+    if (!(total > limit + 1e-9)) return;
+    const hit = {
+      windowStartMin: t,
+      windowStart: windowMinToStr(t),
+      windowEnd: windowMinToStr(t + ROLLING_WINDOW_MINUTES),
+      total,
+      overflow: round3(total - limit),
+    };
+    if (!earliest || t < earliest.windowStartMin) earliest = hit;
+    if (!worst || hit.overflow > worst.overflow + 1e-9) worst = hit;
+  };
+
+  for (let i = 0; i < E.length - 1; i++) {
+    const e = E[i];
+    if (e > hi) break;
+    const next = E[i + 1];
+    const last = Math.min(next - 1, hi);
+    const fe = windowExposureAt(pieces, e, e + ROLLING_WINDOW_MINUTES);
+    if (fe > limit + 1e-9) {
+      consider(e);
+      continue;
+    }
+    if (last > e) {
+      // 斜率 = 右边界进入照度 − 左边界离开照度；斜率为正时区间末端最大
+      const slope = luxAtMinute(pieces, e + ROLLING_WINDOW_MINUTES) - luxAtMinute(pieces, e);
+      if (slope > 0) {
+        const fEnd = fe + (last - e) * slope;
+        if (fEnd > limit + 1e-9) {
+          // 首个严格超限的整数分钟：(t-e)*slope > limit-fe
+          const k = Math.floor((limit - fe) / slope) + 1;
+          if (e + k <= last) consider(e + k);
+          consider(last);
+        }
+      }
+    }
+  }
+  return { earliest, worst };
+}
+
+// 找出每件作品的最早超限滚动窗口。
+// piecesByArt：Map<artworkId, 分段数组>（全部参与累计的来源）
+// limitByArt：Map<artworkId, 非负上限>（无上限 / null 的作品跳过）
+// focusByArt：可选 Map<artworkId, 分段数组>；给出后只保留与这些分段（本批未开始 / 本时段）
+//             至少重合 1 分钟的窗口——即仅校验“本批未开始时段参与的窗口”。
+// 返回 [{artworkId, windowStart, windowEnd, dailyLimit, total, overflow}]，
+// 按窗口开始时间（再按作品）排序。
+function earliestRollingExceed(piecesByArt, limitByArt, focusByArt = null) {
+  const exceeded = [];
+  for (const [aid, fixed] of piecesByArt) {
+    const limit = limitByArt.get(aid);
+    if (!isNonNegNumber(limit)) continue;
+    const focus = focusByArt ? focusByArt.get(aid) : null;
+    if (focusByArt && (!focus || !focus.length)) continue;
+    // 窗口累计包含全部来源：已确定分段 + 本批（或本时段）分段；focus 同时限定只校验其参与的窗口
+    const pieces = focus ? fixed.concat(focus) : fixed;
+    if (!pieces.length) continue;
+    const { earliest } = scanRollingWindows(pieces, limit, focus);
+    if (earliest) exceeded.push({ artworkId: aid, dailyLimit: limit, ...earliest });
+  }
+  return exceeded.sort((a, b) => a.windowStartMin - b.windowStartMin || a.artworkId - b.artworkId);
+}
+
 // ---------- 更正记录 ----------
 function loadCorrections(db) {
   const rows = db.prepare('SELECT * FROM slot_corrections ORDER BY slot_id, seq_no, id').all();
@@ -375,6 +528,7 @@ function summarize(db) {
       id: a.id,
       name: a.name,
       limit: a.limit_amount,
+      dailyLimit: a.daily_limit_amount == null ? null : a.daily_limit_amount,
       existing: a.existing_amount,
       note: a.note,
       used,
@@ -444,6 +598,8 @@ function recomputeBlocked(db) {
   const used = new Map(artworks.map((a) => [a.id, a.existing_amount]));
   const names = new Map(artworks.map((a) => [a.id, a.name]));
   const limits = new Map(artworks.map((a) => [a.id, a.limit_amount]));
+  // 作品级滚动 24 小时曝光上限：null 表示不限制
+  const dailyLimits = new Map(artworks.map((a) => [a.id, a.daily_limit_amount == null ? null : a.daily_limit_amount]));
 
   // 组维度：作品 -> 组；组已用从成员既有累计量起算
   const groupOf = new Map();   // artworkId -> groupId
@@ -466,26 +622,37 @@ function recomputeBlocked(db) {
     if (gid != null) groupUsed.set(gid, groupUsed.get(gid) + expo);
   };
 
+  // 滚动窗口：按作品收集“已确定”的照度分段（已结束实际分段 + 进行中冻结计划）
+  const piecesByArt = new Map(artworks.map((a) => [a.id, []]));
+  const appendPiece = (aid, p) => {
+    const list = piecesByArt.get(aid);
+    if (list) list.push(p);
+  };
+
   for (const s of slots) {
     if (s.status === 'finished') {
       for (const aid of s.artworkIds) {
         if (used.has(aid)) used.set(aid, used.get(aid) + (s.actual_exposure || 0));
         addGroup(aid, s.actual_exposure || 0);
+        finishedSlotPieces(s).forEach((p) => appendPiece(aid, p));
       }
     } else if (s.status === 'running') {
       const expo = plannedExposure(s) || 0;
       for (const aid of s.artworkIds) {
         if (used.has(aid)) used.set(aid, used.get(aid) + expo);
         addGroup(aid, expo);
+        plannedSlotPieces(s).forEach((p) => appendPiece(aid, p));
       }
     }
   }
 
-  // 有效计划外曝光：与已结束时段同属历史实耗，计入已用基线（允许余额为负）
+  // 有效计划外曝光：与已结束时段同属历史实耗，计入已用基线（允许余额为负）；
+  // 归档分段同样进入滚动 24 小时窗口累计。
   for (const r of loadExposureRecords(db)) {
     if (r.status !== 'active') continue;
     if (used.has(r.artwork_id)) used.set(r.artwork_id, used.get(r.artwork_id) + r.exposure);
     addGroup(r.artwork_id, r.exposure);
+    exposureRecordPieces(r).forEach((p) => appendPiece(r.artwork_id, p));
   }
 
   const ordered = slots
@@ -498,6 +665,16 @@ function recomputeBlocked(db) {
   const upd = db.prepare('UPDATE slots SET blocked = ?, blocked_reason = ? WHERE id = ?');
   for (const s of ordered) {
     const expo = plannedExposure(s) || 0;
+    // 本时段计划分段（每件关联作品各一条，同照度逐件计入）
+    const slotPiecesByArt = new Map();
+    for (const aid of s.artworkIds) {
+      if (!piecesByArt.has(aid)) continue;
+      plannedSlotPieces(s).forEach((p) => {
+        if (!slotPiecesByArt.has(aid)) slotPiecesByArt.set(aid, []);
+        slotPiecesByArt.get(aid).push(p);
+      });
+    }
+
     const gaps = [];
     for (const aid of s.artworkIds) {
       if (!used.has(aid)) continue;
@@ -533,19 +710,48 @@ function recomputeBlocked(db) {
         });
       }
     }
-    if (gaps.length > 0 || groupGaps.length > 0) {
-      upd.run(1, JSON.stringify({ gaps, groupGaps }), s.id);
-      // 不可启动：不占用后续预算
+    // 滚动 24 小时缺口：仅校验本时段（本未开始时段）参与的窗口
+    const rollingGaps = rollingGapsForSlot(piecesByArt, dailyLimits, slotPiecesByArt, names);
+    if (gaps.length > 0 || groupGaps.length > 0 || rollingGaps.length > 0) {
+      upd.run(1, JSON.stringify({ gaps, groupGaps, rollingGaps }), s.id);
+      // 不可启动：不占用后续滚动额度
     } else {
       upd.run(0, '{}', s.id);
       for (const aid of s.artworkIds) {
         if (used.has(aid)) used.set(aid, used.get(aid) + expo);
         addGroup(aid, expo);
+        const mine = slotPiecesByArt.get(aid);
+        if (mine) piecesByArt.get(aid).push(...mine);
       }
     }
   }
   // 进行中 / 已结束时段不参与“不可启动”标记
   db.prepare("UPDATE slots SET blocked = 0, blocked_reason = '{}' WHERE status != 'scheduled'").run();
+}
+
+// 评估一个候选未开始时段的滚动 24 小时上限：对每件设置了上限的作品，
+// 在“已确定分段 + 已接受的未开始分段 + 本时段分段”中，只看与本时段重合的窗口；
+// 取缺口（窗口累计 − 上限）最大的窗口作为阻断依据。
+function rollingGapsForSlot(piecesByArt, dailyLimits, slotPiecesByArt, names) {
+  const rollingGaps = [];
+  for (const [aid, focusList] of slotPiecesByArt) {
+    const limit = dailyLimits.get(aid);
+    if (!isNonNegNumber(limit)) continue;
+    const pieces = (piecesByArt.get(aid) || []).concat(focusList);
+    const { worst } = scanRollingWindows(pieces, limit, focusList);
+    if (worst) {
+      rollingGaps.push({
+        artworkId: aid,
+        artworkName: names.get(aid),
+        dailyLimit: limit,
+        windowStart: worst.windowStart,
+        windowEnd: worst.windowEnd,
+        total: worst.total,
+        overflow: worst.overflow,
+      });
+    }
+  }
+  return rollingGaps;
 }
 
 function bumpVersion(db) {
@@ -572,6 +778,14 @@ module.exports = {
   representativeLux,
   plannedExposure,
   actualExposure,
+  ROLLING_WINDOW_MINUTES,
+  plannedSlotPieces,
+  finishedSlotPieces,
+  exposureRecordPieces,
+  windowExposureAt,
+  windowTouches,
+  scanRollingWindows,
+  earliestRollingExceed,
   summarize,
   recomputeBlocked,
   bumpVersion,

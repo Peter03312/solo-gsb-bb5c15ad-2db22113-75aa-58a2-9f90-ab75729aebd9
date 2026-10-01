@@ -130,6 +130,7 @@ const server = http.createServer(async (req, res) => {
       if (err.conflicts) payload.conflicts = err.conflicts;
       if (err.budgetExceeded) payload.budgetExceeded = err.budgetExceeded;
       if (err.groupExceeded) payload.groupExceeded = err.groupExceeded;
+      if (err.rollingExceeded) payload.rollingExceeded = err.rollingExceeded;
       if (err.blockedReason) payload.blockedReason = err.blockedReason;
       if (err.segmentErrors) payload.segmentErrors = err.segmentErrors;
       return sendJson(res, err.status, payload);

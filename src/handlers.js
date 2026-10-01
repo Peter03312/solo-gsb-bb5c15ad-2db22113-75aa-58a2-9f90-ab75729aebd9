@@ -61,16 +61,24 @@ function validateArtwork(body, db, selfId = null) {
   if (existing > limit + 1e-9) {
     throw new HttpError(422, 'VALIDATION', '既有累计量不得超过展期曝光上限', { field: 'existing' });
   }
+  // 可选滚动 24 小时曝光上限：缺省 / null / 空串表示不限制；非空须为非负数值
+  let dailyLimit = null;
+  if (body.dailyLimit !== undefined && body.dailyLimit !== null && String(body.dailyLimit).trim() !== '') {
+    dailyLimit = Number(body.dailyLimit);
+    if (!B.isNonNegNumber(dailyLimit)) {
+      throw new HttpError(422, 'VALIDATION', '滚动 24 小时曝光上限必须为非负数值（或留空表示不限制）', { field: 'dailyLimit' });
+    }
+  }
   const note = typeof body.note === 'string' ? body.note.trim().slice(0, 200) : '';
-  return { name, limit, existing, note };
+  return { name, limit, existing, dailyLimit, note };
 }
 
 function createArtwork(db, body) {
   requireVersion(db, body);
   const d = validateArtwork(body, db);
   const tx = db.transaction(() => {
-    db.prepare('INSERT INTO artworks (name, limit_amount, existing_amount, note) VALUES (?, ?, ?, ?)')
-      .run(d.name, d.limit, d.existing, d.note);
+    db.prepare('INSERT INTO artworks (name, limit_amount, existing_amount, daily_limit_amount, note) VALUES (?, ?, ?, ?, ?)')
+      .run(d.name, d.limit, d.existing, d.dailyLimit, d.note);
     B.recomputeBlocked(db);
     B.bumpVersion(db);
     return B.summarize(db);
@@ -82,8 +90,8 @@ function updateArtwork(db, id, body) {
   requireVersion(db, body);
   const d = validateArtwork(body, db, id);
   const tx = db.transaction(() => {
-    const r = db.prepare('UPDATE artworks SET name = ?, limit_amount = ?, existing_amount = ?, note = ? WHERE id = ?')
-      .run(d.name, d.limit, d.existing, d.note, id);
+    const r = db.prepare('UPDATE artworks SET name = ?, limit_amount = ?, existing_amount = ?, daily_limit_amount = ?, note = ? WHERE id = ?')
+      .run(d.name, d.limit, d.existing, d.dailyLimit, d.note, id);
     if (r.changes === 0) throw new HttpError(404, 'NOT_FOUND', `作品 #${id} 不存在`);
     B.recomputeBlocked(db);
     B.bumpVersion(db);
@@ -413,10 +421,46 @@ function replaceSchedule(db, body) {
       });
     }
   }
-  if (budgetExceeded.length || groupExceeded.length) {
-    throw new HttpError(422, 'BATCH_REJECTED', '整批已拒绝：有作品或额度组预占后将超过上限', {
+  // 4) 滚动 24 小时曝光上限：仅校验本批未开始时段参与的窗口。
+  //    已结束取实际分段、进行中取冻结计划、有效计划外记录取归档分段、本批取计划；
+  //    跨窗口边界按重合分钟拆分，同一作品逐条相加。超限指出作品、最早超限窗口与超额量。
+  const piecesByArt = new Map(artworks.map((a) => [a.id, []]));
+  for (const f of frozen) {
+    const list = f.status === 'finished' ? B.finishedSlotPieces(f) : B.plannedSlotPieces(f);
+    for (const aid of f.artworkIds) {
+      const arr = piecesByArt.get(aid);
+      if (arr) arr.push(...list);
+    }
+  }
+  for (const r of activeRecords) {
+    const arr = piecesByArt.get(r.artwork_id);
+    if (arr) arr.push(...B.exposureRecordPieces(r));
+  }
+  const focusByArt = new Map();
+  for (const p of proposed) {
+    for (const aid of p.artworkIds) {
+      if (!focusByArt.has(aid)) focusByArt.set(aid, []);
+      focusByArt.get(aid).push({ start: p.startMin, end: p.endMin, lux: p.lux });
+    }
+  }
+  const dailyLimitByArt = new Map(artworks.map((a) => [
+    a.id, a.daily_limit_amount == null ? null : a.daily_limit_amount,
+  ]));
+  const rollingExceeded = B.earliestRollingExceed(piecesByArt, dailyLimitByArt, focusByArt)
+    .map((x) => ({
+      artworkId: x.artworkId,
+      artworkName: artName.get(x.artworkId),
+      dailyLimit: x.dailyLimit,
+      windowStart: x.windowStart,
+      windowEnd: x.windowEnd,
+      windowExposure: x.total,
+      overflow: x.overflow,
+    }));
+  if (budgetExceeded.length || groupExceeded.length || rollingExceeded.length) {
+    throw new HttpError(422, 'BATCH_REJECTED', '整批已拒绝：有作品或额度组预占后将超过上限（含滚动 24 小时曝光上限）', {
       budgetExceeded,
       groupExceeded,
+      rollingExceeded,
     });
   }
 

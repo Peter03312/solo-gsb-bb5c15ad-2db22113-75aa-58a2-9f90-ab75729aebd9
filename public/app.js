@@ -94,7 +94,7 @@ function groupOfArtwork(aid) {
 function renderArtworks() {
   const tb = $('#artworkTable tbody');
   if (!state.artworks.length) {
-    tb.innerHTML = '<tr class="empty-row"><td colspan="10">还没有作品，点击「录入作品」开始</td></tr>';
+    tb.innerHTML = '<tr class="empty-row"><td colspan="11">还没有作品，点击「录入作品」开始</td></tr>';
     return;
   }
   tb.innerHTML = state.artworks.map((a) => {
@@ -103,6 +103,7 @@ function renderArtworks() {
     <tr>
       <td class="art-name">${esc(a.name)}</td>
       <td class="num">${fmt(a.limit)}</td>
+      <td class="num">${a.dailyLimit == null ? '<span class="daily-off">不限</span>' : fmt(a.dailyLimit)}</td>
       <td class="num">${fmt(a.existing)}</td>
       <td class="num">${fmt(a.used)}${a.unplanned ? `<span class="reserved-detail">含计划外 ${fmt(a.unplanned)}</span>` : ''}</td>
       <td class="num">${fmt(a.reserved)}<span class="reserved-detail">${fmt(a.reservedRunning)} / ${fmt(a.reservedScheduled)}</span></td>
@@ -149,13 +150,16 @@ function renderGroups() {
   `).join('');
 }
 
-// ---------- 阻断原因（单件缺口 + 组缺口） ----------
+// ---------- 阻断原因（单件缺口 + 组缺口 + 滚动 24 小时缺口） ----------
 function gapItems(reason) {
   const items = [];
   ((reason && reason.gaps) || []).forEach((g) => items.push(
     `作品「${esc(g.artworkName)}」：当前可用余额 ${fmt(g.has)}，本时段需要 ${fmt(g.need)}，缺口 <strong>${fmt(g.gap)}</strong> lux·min`));
   ((reason && reason.groupGaps) || []).forEach((g) => items.push(
     `额度组「${esc(g.groupName)}」：组可用余额 ${fmt(g.has)}，本时段需要 ${fmt(g.need)}（${g.memberCount} 件成员逐件计入），缺口 <strong>${fmt(g.gap)}</strong> lux·min`));
+  ((reason && reason.rollingGaps) || []).forEach((g) => items.push(
+    `作品「${esc(g.artworkName)}」滚动 24h 上限 <strong>${fmt(g.dailyLimit)}</strong> lux·min：`
+    + `窗口 ${esc(g.windowStart)} ~ ${esc(g.windowEnd)} 内累计 ${fmt(g.total)} lux·min，超额 <strong>${fmt(g.overflow)}</strong> lux·min`));
   return items;
 }
 function gapText(reason) {
@@ -164,6 +168,8 @@ function gapText(reason) {
     parts.push(`「${g.artworkName}」缺口 ${fmt(g.gap)}（可用 ${fmt(g.has)} / 需 ${fmt(g.need)}）`));
   ((reason && reason.groupGaps) || []).forEach((g) =>
     parts.push(`额度组「${g.groupName}」缺口 ${fmt(g.gap)}（组可用 ${fmt(g.has)} / 需 ${fmt(g.need)}）`));
+  ((reason && reason.rollingGaps) || []).forEach((g) =>
+    parts.push(`「${g.artworkName}」滚动24h窗口 ${g.windowStart} 累计 ${fmt(g.total)}>${fmt(g.dailyLimit)}（超 ${fmt(g.overflow)}）`));
   return parts.join('；');
 }
 
@@ -432,6 +438,9 @@ function formatBatchError(payload) {
   (payload.groupExceeded || []).forEach((g) => {
     lines.push(`• 额度组「${g.groupName}」共用额度超限：已用 ${fmt(g.used)} + 本批预占 ${fmt(g.batchNeed)} = ${fmt(g.projected)}，组上限 ${fmt(g.limit)}，超出 ${fmt(g.overflow)} lux·min`);
     (g.members || []).forEach((m) => lines.push(`    成员「${m.artworkName}」贡献 ${fmt(m.contribution)} lux·min`));
+  });
+  (payload.rollingExceeded || []).forEach((x) => {
+    lines.push(`• 作品「${x.artworkName}」滚动 24 小时曝光上限（${fmt(x.dailyLimit)} lux·min）超限：最早超限窗口 ${x.windowStart} ~ ${x.windowEnd}，窗口内累计 ${fmt(x.windowExposure)} lux·min，超出 ${fmt(x.overflow)} lux·min`);
   });
   (payload.segmentErrors || []).forEach((x) => lines.push(`• ${x}`));
   return lines.join('\n') || '整批校验失败';
@@ -915,6 +924,7 @@ function openArtworkModal(a) {
   $('#artworkModalTitle').textContent = a ? '编辑作品' : '录入作品';
   $('#aw_name').value = a ? a.name : '';
   $('#aw_limit').value = a ? a.limit : '';
+  $('#aw_dailyLimit').value = a && a.dailyLimit != null ? a.dailyLimit : '';
   $('#aw_existing').value = a ? a.existing : '';
   $('#aw_note').value = a ? a.note : '';
   $('#aw_error').classList.add('hidden');
@@ -941,10 +951,12 @@ $('#artworkTable').addEventListener('click', async (e) => {
 });
 
 $('#aw_save').addEventListener('click', async () => {
+  const dailyRaw = $('#aw_dailyLimit').value;
   const payload = {
     version: state.version,
     name: $('#aw_name').value,
     limit: Number($('#aw_limit').value),
+    dailyLimit: dailyRaw === '' ? null : Number(dailyRaw),
     existing: Number($('#aw_existing').value),
     note: $('#aw_note').value,
   };

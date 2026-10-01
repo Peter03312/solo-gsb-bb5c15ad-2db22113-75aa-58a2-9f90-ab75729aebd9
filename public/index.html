@@ -28,7 +28,7 @@
     <section class="card">
       <div class="card-head">
         <h2>作品预算</h2>
-        <div class="hint">已用 = 既有累计 + 已结束时段实际曝光 + 有效计划外曝光；预占 = 进行中（冻结）+ 未开始时段；余额 = 上限 − 已用 − 预占</div>
+        <div class="hint">已用 = 既有累计 + 已结束时段实际曝光 + 有效计划外曝光；预占 = 进行中（冻结）+ 未开始时段；余额 = 上限 − 已用 − 预占。另可为每件作品设置可选的<strong>滚动 24 小时曝光上限</strong>（lux·min，留空不限制）：对任意连续 24 小时窗口按分钟累计，超限将阻断相关未开始时段启动</div>
         <button class="btn btn-primary" id="addArtworkBtn">＋ 录入作品</button>
       </div>
       <div class="table-wrap">
@@ -37,6 +37,7 @@
             <tr>
               <th>作品</th>
               <th class="num">展期上限</th>
+              <th class="num">滚动24h上限</th>
               <th class="num">既有累计</th>
               <th class="num">已用</th>
               <th class="num">预占<span class="th-sub">进行中 / 未开始</span></th>
@@ -154,6 +155,7 @@
       <h3 id="artworkModalTitle">录入作品</h3>
       <div class="form-row"><label>作品名称</label><input type="text" id="aw_name" maxlength="100" /></div>
       <div class="form-row"><label>展期曝光上限（lux·min）</label><input type="number" id="aw_limit" min="0" step="1" /></div>
+      <div class="form-row"><label>滚动 24 小时上限（lux·min，留空不限制）</label><input type="number" id="aw_dailyLimit" min="0" step="1" placeholder="留空 = 不限制" /></div>
       <div class="form-row"><label>既有累计量（lux·min）</label><input type="number" id="aw_existing" min="0" step="1" /></div>
       <div class="form-row"><label>备注</label><input type="text" id="aw_note" maxlength="200" /></div>
       <div class="form-error hidden" id="aw_error"></div>
