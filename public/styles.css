@@ -256,3 +256,6 @@ td.cell-expo { font-family: var(--mono); font-size: 12.5px; white-space: nowrap;
   main { padding: 14px; }
   .form-row label { width: 130px; }
 }
+
+/* 滚动 24h 上限未设置（不限制） */
+.rolling-none { color: var(--muted); font-size: 12px; }

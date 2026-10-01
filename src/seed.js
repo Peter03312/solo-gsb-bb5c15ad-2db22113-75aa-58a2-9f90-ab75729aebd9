@@ -14,12 +14,16 @@ function seed(db) {
   if (hasData) return false;
 
   const insArt = db.prepare(
-    'INSERT INTO artworks (name, limit_amount, existing_amount, note) VALUES (?, ?, ?, ?)'
+    'INSERT INTO artworks (name, limit_amount, rolling_limit, existing_amount, note) VALUES (?, ?, ?, ?, ?)'
   );
   const artIds = {};
-  artIds.w1 = insArt.run('《山水轴》纸本水墨', 120000, 12000, '对光敏感').lastInsertRowid;
-  artIds.w2 = insArt.run('《星夜手稿》水彩', 100000, 20000, '').lastInsertRowid;
-  artIds.w3 = insArt.run('《青铜纹样》摄影', 120000, 30000, '耐照度较高').lastInsertRowid;
+  artIds.w1 = insArt.run('《山水轴》纸本水墨', 120000, null, 12000, '对光敏感').lastInsertRowid;
+  artIds.w2 = insArt.run('《星夜手稿》水彩', 100000, null, 20000, '').lastInsertRowid;
+  // 《青铜纹样》演示可选的滚动 24 小时曝光上限 40000 lux·min：
+  // 10-02 联展（27000）与 10-03 独享时段（19800）相隔 20.5 小时，可同入一个 24h 窗口；
+  // 初始排期的窗口峰值为 37800（窗口 10-02 11:00 起算：联展 120 分×150 + 独享 19800），恰好不超限。
+  // 把上限下调到 37800 以下（或加长 / 加亮 / 新增邻近时段）即可看到滚动缺口与启动阻断。
+  artIds.w3 = insArt.run('《青铜纹样》摄影', 120000, 40000, 30000, '耐照度较高；设滚动 24h 上限').lastInsertRowid;
 
   const insSlot = db.prepare(`
     INSERT INTO slots (hall, seq, status, planned_start, planned_end, planned_lux,

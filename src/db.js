@@ -17,10 +17,12 @@ CREATE TABLE IF NOT EXISTS meta (
 );
 
 -- 作品：展期曝光上限（lux·min）与既有累计量
+-- rolling_limit：可选的滚动 24 小时曝光上限（lux·min）；NULL 表示不限制
 CREATE TABLE IF NOT EXISTS artworks (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   name TEXT NOT NULL UNIQUE,
   limit_amount REAL NOT NULL CHECK (limit_amount >= 0),
+  rolling_limit REAL CHECK (rolling_limit IS NULL OR rolling_limit >= 0),
   existing_amount REAL NOT NULL CHECK (existing_amount >= 0),
   note TEXT NOT NULL DEFAULT ''
 );
@@ -126,9 +128,10 @@ CREATE TABLE IF NOT EXISTS quota_group_members (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_quota_group_members_artwork ON quota_group_members(artwork_id);
 `;
 
-// 旧库升级：为已存在的 slots 表补齐多段结算列
+// 旧库升级：为已存在的表补齐新列
 const MIGRATIONS = [
   `ALTER TABLE slots ADD COLUMN actual_segments TEXT NOT NULL DEFAULT '[]'`,
+  `ALTER TABLE artworks ADD COLUMN rolling_limit REAL`,
 ];
 
 function openDb() {
@@ -140,9 +143,15 @@ function openDb() {
   db.pragma('foreign_keys = ON');
   db.exec(SCHEMA);
   for (const sql of MIGRATIONS) {
-    const hasCol = db.prepare("PRAGMA table_info(slots)").all()
-      .some((c) => c.name === 'actual_segments');
-    if (!hasCol) db.exec(sql);
+    if (sql.startsWith('ALTER TABLE slots')) {
+      const hasCol = db.prepare("PRAGMA table_info(slots)").all()
+        .some((c) => c.name === 'actual_segments');
+      if (!hasCol) db.exec(sql);
+    } else if (sql.startsWith('ALTER TABLE artworks')) {
+      const hasCol = db.prepare("PRAGMA table_info(artworks)").all()
+        .some((c) => c.name === 'rolling_limit');
+      if (!hasCol) db.exec(sql);
+    }
   }
   return db;
 }

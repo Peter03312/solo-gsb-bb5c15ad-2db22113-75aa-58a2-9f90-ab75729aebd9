@@ -687,6 +687,187 @@ const getState = async () => (await call('GET', '/api/state')).json;
   r = await call('DELETE', `/api/artworks/${delArt}`, { version: v });
   ok(r.status === 409 && r.json.error.code === 'IN_USE', '有计划外曝光记录的作品不可删除（归档保留）');
 
+  console.log('# 31. 滚动 24h 上限：配置（空值不限 / 非负校验）与整批超限拒绝');
+  st = await getState();
+  v = st.version;
+  // 演示作品 #3 自带滚动上限 40000（初始窗口峰值 37800，不超限）
+  ok(st.artworks.find((a) => a.id === 3).rollingLimit === 40000, '作品 #3 初始滚动上限 40000');
+  ok(st.artworks.find((a) => a.id === 1).rollingLimit === null, '未设置作品滚动上限为 null（不限制）');
+  // 负值拒绝
+  const w3now = st.artworks.find((a) => a.id === 3);
+  r = await call('PUT', '/api/artworks/3', { version: v, name: w3now.name, limit: w3now.limit, rollingLimit: -5, existing: w3now.existing, note: w3now.note });
+  ok(r.status === 422 && r.json.error.code === 'VALIDATION', '负滚动上限被拒绝');
+  // 字符串非法值拒绝
+  r = await call('PUT', '/api/artworks/3', { version: v, name: w3now.name, limit: w3now.limit, rollingLimit: 'abc', existing: w3now.existing, note: w3now.note });
+  ok(r.status === 422, '非法滚动上限被拒绝');
+  st = await getState();
+  ok(st.version === v && st.artworks.find((a) => a.id === 3).rollingLimit === 40000, '校验失败不改版本与上限');
+
+  // 独立作品做滚动整批校验（避免与既有数据耦合）
+  r = await call('POST', '/api/artworks', { version: v, name: '滚动测试品', limit: 1000000, rollingLimit: 20000, existing: 0 });
+  ok(r.status === 200, '滚动测试作品已创建（滚动上限 20000）');
+  const rollArt = r.json.artworks.at(-1).id;
+  v = r.json.version;
+  // 两段各 60 分钟 × 200 = 12000，间隔 23 小时：可同入一个 24h 窗口 → 峰值 24000 > 20000，整批拒绝
+  r = await call('POST', '/api/schedule', { version: v, slots: [
+    { cid: 'r1', hall: '甲厅', start: '2027-03-01T10:00', end: '2027-03-01T11:00', lux: 200, artworkIds: [rollArt] },
+    { cid: 'r2', hall: '乙厅', start: '2027-03-02T09:00', end: '2027-03-02T10:00', lux: 200, artworkIds: [rollArt] },
+  ]});
+  const re1 = r.json.rollingExceeded?.[0];
+  ok(r.status === 422 && r.json.error.code === 'BATCH_REJECTED' && re1 && re1.artworkId === rollArt
+     && re1.rollingLimit === 20000 && re1.peakWindowExposure === 24000 && re1.peakOverflow === 4000
+     && Array.isArray(re1.batchSlots) && re1.batchSlots.length === 2,
+     `间隔 23h 的两段同窗超限整批拒绝（峰值 ${re1?.peakWindowExposure}，超额 ${re1?.peakOverflow}）`);
+  st = await getState();
+  ok(st.version === v, '滚动超限拒绝后版本不变');
+  // 间隔 24 小时以上（第二段 11:00 开始，与第一段间隔 25h）→ 任意窗口不能同时完整包含，峰值 12000 ≤ 20000
+  r = await call('POST', '/api/schedule', { version: v, slots: [
+    { cid: 'r1', hall: '甲厅', start: '2027-03-01T10:00', end: '2027-03-01T11:00', lux: 200, artworkIds: [rollArt] },
+    { cid: 'r2', hall: '乙厅', start: '2027-03-02T11:00', end: '2027-03-02T12:00', lux: 200, artworkIds: [rollArt] },
+  ]});
+  ok(r.status === 200 && !r.json.rollingExceeded, '间隔超过 24h：滚动校验通过、整批保存');
+  v = r.json.version;
+
+  console.log('# 32. 滚动窗口按重合分钟拆分：边界时段部分计入，最早超限窗口与超额量');
+  // 单段 25h 匀速：任意 24h 窗口最多含 1440 分钟。10 lux × 1440 = 14400 ≤ 20000 通过
+  r = await call('POST', '/api/schedule', { version: v, slots: [
+    { cid: 'long', hall: '丙厅', start: '2027-03-05T00:00', end: '2027-03-06T01:00', lux: 10, artworkIds: [rollArt] },
+  ]});
+  ok(r.status === 200, '25 小时 × 10 lux（窗口峰值 14400 ≤ 20000）通过');
+  v = r.json.version;
+  // 20 lux × 1440 = 28800 > 20000 → 拒绝；候选参与的最早窗口在开始前一天线性递增处：
+  // w=2027-03-04T16:41 起窗口内含该段 1001 分钟 = 20020（首个越限整数分钟窗口）
+  r = await call('POST', '/api/schedule', { version: v, slots: [
+    { cid: 'long', hall: '丙厅', start: '2027-03-05T00:00', end: '2027-03-06T01:00', lux: 20, artworkIds: [rollArt] },
+  ]});
+  const re2 = r.json.rollingExceeded?.[0];
+  ok(r.status === 422 && re2 && re2.windowStart === '2027-03-04T16:41'
+     && re2.windowExposure === 20020 && re2.overflow === 20
+     && re2.peakWindowStart === '2027-03-05T00:00' && re2.peakWindowExposure === 28800
+     && re2.peakOverflow === 8800,
+     `长时段最早超限窗口在线性段内（${re2?.windowStart}，累计 ${re2?.windowExposure}，超额 ${re2?.overflow}），峰值 28800`);
+  st = await getState();
+  ok(st.version === v, '拒绝不改版本');
+  // 两段（各 200 lux）：a 03-01 10:00–11:00、b 03-02 09:00–11:00。
+  // w=03-01 09:41 起窗口完整含 a（60 分）+ b 头 41 分 = 101 分×200 = 20200（首个越限）；
+  // 峰值窗口完整含 b（120 分×200=24000）。
+  r = await call('POST', '/api/schedule', { version: v, slots: [
+    { cid: 'a', hall: '甲厅', start: '2027-03-01T10:00', end: '2027-03-01T11:00', lux: 200, artworkIds: [rollArt] },
+    { cid: 'b', hall: '乙厅', start: '2027-03-02T09:00', end: '2027-03-02T11:00', lux: 200, artworkIds: [rollArt] },
+  ]});
+  const re3 = r.json.rollingExceeded?.[0];
+  ok(r.status === 422 && re3 && re3.windowStart === '2027-03-01T09:41'
+     && re3.windowExposure === 20200 && re3.overflow === 200
+     && re3.peakWindowExposure === 24000 && re3.peakOverflow === 4000
+     && re3.batchSlots.some((x) => x.cid === 'a' && x.overlapMinutes === 60 && x.overlapExposure === 12000)
+     && re3.batchSlots.some((x) => x.cid === 'b' && x.overlapMinutes === 41 && x.overlapExposure === 8200),
+     `边界按重合分钟拆分：最早窗口 ${re3?.windowStart} 累计 ${re3?.windowExposure}，本批各段重合贡献正确（峰值 ${re3?.peakWindowExposure}）`);
+
+  console.log('# 33. 下调滚动上限 → 未开始时段滚动缺口与启动阻断；被阻断时段不占后续额度');
+  r = await call('POST', '/api/schedule', { version: v, slots: [
+    { cid: 'k1', hall: '甲厅', start: '2027-04-01T10:00', end: '2027-04-01T12:00', lux: 100, artworkIds: [rollArt] }, // 12000
+    { cid: 'k2', hall: '乙厅', start: '2027-04-02T11:00', end: '2027-04-02T12:00', lux: 100, artworkIds: [rollArt] }, // 6000，间隔 25h
+  ]});
+  ok(r.status === 200 && r.json.slots.filter((s) => s.status === 'scheduled').every((s) => !s.blocked), '上限 20000：两段均可启动');
+  v = r.json.version;
+  const k1 = r.json.slots.find((s) => s.plannedStart.startsWith('2027-04-01T10'));
+  const k2 = r.json.slots.find((s) => s.plannedStart.startsWith('2027-04-02T11'));
+  // 下调到 10000：k1 自身 12000 即超 → 阻断；k2 与 k1 间隔 25h 不可能同窗，且 k1 阻断不占额度 → k2 仍可启动
+  r = await call('PUT', `/api/artworks/${rollArt}`, { version: v, name: '滚动测试品', limit: 1000000, rollingLimit: 10000, existing: 0 });
+  ok(r.status === 200, '滚动上限下调到 10000');
+  v = r.json.version;
+  const k1b = r.json.slots.find((s) => s.id === k1.id);
+  const k2b = r.json.slots.find((s) => s.id === k2.id);
+  const rg1 = k1b.blockedReason.rollingGaps?.[0];
+  ok(k1b.blocked && rg1 && rg1.cap === 10000 && rg1.windowExposure === 12000 && rg1.gap === 2000
+     && rg1.windowStart === '2027-04-01T10:00',
+     `k1 滚动缺口阻断（窗口 ${rg1?.windowStart}，累计 ${rg1?.windowExposure}，缺口 ${rg1?.gap}）`);
+  ok(!k2b.blocked, 'k2 与 k1 相隔 >24h 且被阻断时段不占滚动额度：k2 仍可启动');
+  r = await call('POST', `/api/slots/${k1.id}/start`);
+  ok(r.status === 422 && r.json.error.code === 'BLOCKED' && r.json.blockedReason.rollingGaps?.[0]?.gap === 2000,
+     '滚动缺口时段禁止启动');
+  r = await call('POST', `/api/slots/${k2.id}/start`);
+  ok(r.status === 200, 'k2 可正常启动（被阻断的 k1 不占后续滚动额度）');
+  v = r.json.version;
+
+  console.log('# 34. 结算造成的历史滚动超限保留事实，仅阻断后续未开始时段');
+  // k2 已启动（2027-04-02 11:00–12:00 冻结 6000）。再排 k3（04-03 11:30–12:30, 100 lux = 6000），
+  // 与 k2 相隔 23h30m，冻结照度下同窗峰值不超限。
+  r = await call('POST', '/api/schedule', { version: v, slots: [
+    { cid: 'k3', hall: '丙厅', start: '2027-04-03T11:30', end: '2027-04-03T12:30', lux: 100, artworkIds: [rollArt] },
+  ]});
+  ok(r.status === 200, 'k3 已排入未开始排期');
+  v = r.json.version;
+  const k3 = r.json.slots.find((s) => s.plannedStart.startsWith('2027-04-03'));
+  ok(!k3.blocked, 'k3 结算前可启动');
+  // 结算 k2 实际照度 400 → 24000（替换冻结 6000）。
+  // k3 参与的最早窗口 w=04-02 11:31：含已结算 k2 尾段 29 分×400=11600 + k3 头 1 分×100=100 → 11700 > 10000。
+  r = await call('POST', `/api/slots/${k2.id}/settle`, { version: v, actualStart: '2027-04-02T11:00', actualEnd: '2027-04-02T12:00', segments: [
+    { start: '2027-04-02T11:00', end: '2027-04-02T12:00', lux: 400 },
+  ]});
+  ok(r.status === 200 && r.json.justFinishedExposure === 24000, 'k2 结算为实际 24000（替换冻结 6000）');
+  v = r.json.version;
+  const k3b = r.json.blockedAfterFinish.find((s) => s.id === k3.id);
+  const rg3 = k3b?.blockedReason?.rollingGaps?.[0];
+  ok(!!k3b && rg3 && rg3.windowStart === '2027-04-02T11:31' && rg3.windowExposure === 11700 && rg3.gap === 1700
+     && rg3.windowBaseline === 11600 && rg3.need === 100,
+     `历史结算超限保留，k3 被滚动缺口阻断（窗口 ${rg3?.windowStart}，基线 ${rg3?.windowBaseline} + 本时段 ${rg3?.need} = ${rg3?.windowExposure}，缺口 ${rg3?.gap}）`);
+  // 已结束的 k2 状态与实际曝光保留
+  st = await getState();
+  ok(st.slots.find((s) => s.id === k2.id).status === 'finished'
+     && st.slots.find((s) => s.id === k2.id).actualExposure === 24000,
+     '历史结算事实与已结束状态保留');
+
+  console.log('# 35. 清空滚动上限后缺口解除；多段照度计划外记录参与滚动基线');
+  r = await call('PUT', `/api/artworks/${rollArt}`, { version: v, name: '滚动测试品', limit: 1000000, rollingLimit: null, existing: 0 });
+  ok(r.status === 200 && r.json.artworks.find((a) => a.id === rollArt).rollingLimit === null, '清空滚动上限（null）');
+  v = r.json.version;
+  ok(r.json.slots.find((s) => s.id === k3.id) && !r.json.slots.find((s) => s.id === k3.id).blocked, '清空后 k3 滚动阻断解除');
+
+  // 独立作品：滚动上限 17000，先排 04-05 09:00–10:00 100 lux = 6000
+  r = await call('POST', '/api/artworks', { version: v, name: '滚动记录测试品', limit: 1000000, rollingLimit: 17000, existing: 0 });
+  ok(r.status === 200, '滚动记录测试作品已创建（滚动上限 17000）');
+  const rollArt2 = r.json.artworks.at(-1).id;
+  v = r.json.version;
+  r = await call('POST', '/api/schedule', { version: v, slots: [
+    { cid: 'q', hall: '丁厅', start: '2027-04-05T09:00', end: '2027-04-05T10:00', lux: 100, artworkIds: [rollArt2] },
+  ]});
+  ok(r.status === 200 && !r.json.slots.find((s) => s.plannedStart.startsWith('2027-04-05')).blocked, 'q 时段（6000）可启动');
+  v = r.json.version;
+  const qId = r.json.slots.find((s) => s.plannedStart.startsWith('2027-04-05')).id;
+  // 有效计划外记录（多段，与时段不重叠但可同入一个 24h 窗口）：
+  // 04-04 09:30–10:00 200 lux = 6000 + 10:00–11:00 150 lux = 9000 → 共 15000
+  r = await call('POST', '/api/exposure-records', { version: v, artworkId: rollArt2,
+    start: '2027-04-04T09:30', end: '2027-04-04T11:00',
+    segments: [
+      { start: '2027-04-04T09:30', end: '2027-04-04T10:00', lux: 200 },
+      { start: '2027-04-04T10:00', end: '2027-04-04T11:00', lux: 150 },
+    ] });
+  // 峰值窗口 w=04-04 09:30：完整含记录 15000 + q 头 30 分×100=3000 → 18000 > 17000（缺口 1000）
+  const rgRec = r.json.blockedAfterRecord.find((s) => s.id === qId)?.blockedReason?.rollingGaps?.[0];
+  ok(r.status === 200 && rgRec && rgRec.windowStart === '2027-04-04T09:30'
+     && rgRec.windowExposure === 18000 && rgRec.windowBaseline === 15000
+     && rgRec.need === 3000 && rgRec.gap === 1000,
+     `有效计划外多段记录并入滚动基线致 q 阻断（峰值窗口 ${rgRec?.windowStart}：${rgRec?.windowBaseline} + ${rgRec?.need} = ${rgRec?.windowExposure}，缺口 ${rgRec?.gap}）`);
+  const rollRecId = r.json.record.id;
+  v = r.json.version;
+  // 作废记录后滚动阻断重算解除
+  r = await call('POST', `/api/exposure-records/${rollRecId}/void`, { version: v, reason: '滚动测试清理：记录误登' });
+  ok(r.status === 200 && !r.json.slots.find((s) => s.id === qId).blocked, '作废计划外记录后滚动缺口重算解除');
+  v = r.json.version;
+
+  console.log('# 36. 滚动配置与排期提交沿用版本校验：过期 409 且失败不改版本');
+  r = await call('PUT', `/api/artworks/${rollArt2}`, { version: 1, name: '滚动记录测试品', limit: 1000000, rollingLimit: 1, existing: 0 });
+  ok(r.status === 409 && r.json.error.code === 'VERSION_STALE' && r.json.state.version === v,
+     '作品滚动配置过期版本返回 409 与最新预算');
+  r = await call('POST', '/api/schedule', { version: 1, slots: [
+    { cid: 'z', hall: '戊厅', start: '2027-05-01T10:00', end: '2027-05-02T10:00', lux: 100, artworkIds: [rollArt2] },
+  ]});
+  ok(r.status === 409 && r.json.error.code === 'VERSION_STALE' && r.json.state.version === v,
+     '排期滚动校验过期版本返回 409 与最新预算');
+  st = await getState();
+  ok(st.version === v && st.artworks.find((a) => a.id === rollArt2).rollingLimit === 17000, '失败不改版本与上限');
+
   console.log(`\n结果：${pass} 通过，${fail} 失败`);
   process.exit(fail ? 1 : 0);
 })().catch((e) => { console.error(e); process.exit(1); });
